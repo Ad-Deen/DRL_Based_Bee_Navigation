@@ -25,7 +25,7 @@ MODE = "test"                       # "train" or "test"
 TEST_EPISODES = 5                    # Number of episodes to run in test mode
 
 SAVE_DIR = "/home/deen/ppo_test/drone_flight_expert/"
-MODEL_NAME = "velocity_expert"
+MODEL_NAME = "velocity_expert_wind_final"
 PLOT_INTERVAL = 1
 RENDER_EPISODE_FREQ = 100
 SAVE_EPISODE_INTERVAL = 1
