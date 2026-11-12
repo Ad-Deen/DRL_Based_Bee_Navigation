@@ -201,21 +201,6 @@ python train8.py
 
 ---
 
-## 📁 Expected Directory Layout
-
-```
-<SAVE_DIR>/
-├── path_follower.zip                 # trained model (created by train6/train7)
-├── path_follower_replay_buffer.pkl   # replay buffer (created by train6/train7)
-├── path_history.npz                  # episode history
-├── path_plot.png                     # training curves
-└── test_ep_{N}_log.csv               # per-step logs (train7 / train8 only)
-
-<VELOCITY_EXPERT_PATH>.zip            # PPO flight expert (user must provide)
-```
-
----
-
 ## ❓ Troubleshooting
 
 | Symptom | Fix |
