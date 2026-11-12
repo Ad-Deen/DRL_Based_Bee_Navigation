@@ -1,0 +1,28 @@
+# ============================================================
+#  Hierarchical DRL Navigation for UAS
+#  Python 3.10+ required
+#
+#  Install:
+#      pip install -r requirements.txt
+#
+#  NOTE: pip installs the CPU build of PyTorch by default.
+#        For GPU (CUDA), install torch first from:
+#        https://pytorch.org/get-started/locally/
+# ============================================================
+
+# --- Deep learning ---
+torch>=2.0.0,<3.0.0
+
+# --- Reinforcement learning ---
+# SB3 2.5.0+ required (SAC constructor uses `n_steps` param)
+stable-baselines3>=2.5.0,<3.0.0
+
+# --- Environment interface ---
+gymnasium>=0.29.0,<2.0.0
+
+# --- Numerical + vision ---
+numpy>=1.24.0,<3.0.0
+opencv-python>=4.8.0
+
+# --- Plotting ---
+matplotlib>=3.7.0
