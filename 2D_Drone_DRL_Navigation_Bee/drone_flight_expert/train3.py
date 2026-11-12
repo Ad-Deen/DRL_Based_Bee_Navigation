@@ -4,7 +4,9 @@ velocity_agent_final.py
 Single-file solution: environment + training/testing loop.
 Set MODE = "train" to train a new model, or "test" to evaluate a saved model.
 
-
+Wind: Natural-like distribution — per-episode personality + Markov regime
+transitions + exponential durations. The expert never sees wind directly;
+it must infer disturbance from velocity-error feedback.
 """
 
 import os
@@ -21,20 +23,20 @@ from stable_baselines3.common.callbacks import BaseCallback
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
-MODE = "test"                       # "train" or "test"
-TEST_EPISODES = 5                    # Number of episodes to run in test mode
+MODE = "train"                       # "train" or "test"
+TEST_EPISODES = 5
 
 SAVE_DIR = "/home/deen/ppo_test/drone_flight_expert/"
-MODEL_NAME = "velocity_expert_wind_final"
-PLOT_INTERVAL = 1
+MODEL_NAME = "velocity_expert_wind"
+PLOT_INTERVAL = 10
 RENDER_EPISODE_FREQ = 100
-SAVE_EPISODE_INTERVAL = 1
-LOAD_EXISTING_MODEL = False         # False = fresh training with wind
+SAVE_EPISODE_INTERVAL = 20
+LOAD_EXISTING_MODEL = True
 # =====================================================================
 
 
 # =====================================================================
-# 1. ENVIRONMENT (with abrupt wind + position tracking + rendering)
+# 1. ENVIRONMENT (with natural wind + position tracking + rendering)
 # =====================================================================
 
 class VelocityTrackingEnv(gym.Env):
@@ -43,7 +45,8 @@ class VelocityTrackingEnv(gym.Env):
     Observation: [vx, vy, theta, vtheta, target_vx, target_vy]  (6-dim, wind BLIND)
     Action:      [L_thrust, R_thrust]                            (2-dim, [0,1])
     World:       40x40 with wrap-around (toroidal).
-    Wind:        abrupt 2D force, changes every 1-3 s (never in obs).
+    Wind:        Natural-like — per-episode personality, Markov regime
+                 transitions, exponential durations. Never in obs.
     """
     def __init__(self):
         super().__init__()
@@ -55,48 +58,49 @@ class VelocityTrackingEnv(gym.Env):
         self.d = 0.4
         self.I = 0.3
 
-        # ---- NEW: Abrupt wind disturbance ----
+        # ---- Wind disturbance: natural distribution ----
         self.use_wind = True
-        self.wind_max_force = 15.0          # N — peak gust magnitude
-        self.wind_x = 0.0                   # current wind force (N)
-        self.wind_y = 0.0
-        self.wind_change_interval_min = 50  # steps (1.0 s at dt=0.02)
-        self.wind_change_interval_max = 150 # steps (3.0 s)
-        self.wind_change_counter = 0
-        self.wind_change_interval = np.random.randint(
-            self.wind_change_interval_min, self.wind_change_interval_max
-        )
+        self.wind_max_force = 15.0           # N per axis (peak gust)
 
-        self.smooth_transition_prob = 0.5   # 50% smooth, 50% step changes
+        # Per-episode personality (re-sampled in reset())
+        self.wind_turn_on_prob      = 0.35   # placeholder, set in reset
+        self.wind_stay_on_prob      = 0.25   # placeholder, set in reset
+        self.wind_on_duration_mean  = 100    # steps, set in reset
+        self.wind_off_duration_mean = 200    # steps, set in reset
+
+        # Runtime state
+        self.wind_active = False
+        self.wind_x = 0.0
+        self.wind_y = 0.0
+        self.wind_change_counter = 0
+        self.wind_change_interval = 100
 
         # ---- Target update parameters ----
-        self.target_change_interval_min = 30   # minimum steps between changes
-        self.target_change_interval_max = 80   # maximum steps between changes
+        self.target_change_interval_min = 30
+        self.target_change_interval_max = 80
         self.target_change_counter = 0
         self.target_change_interval = np.random.randint(
             self.target_change_interval_min, self.target_change_interval_max
         )
+
         # ---- Smooth transition parameters ----
-        self.transition_steps = 20              # steps over which to interpolate
+        self.transition_steps = 20
         self.transition_counter = 0
         self.target_vx_start = 0.0
         self.target_vy_start = 0.0
         self.target_vx_end = 0.0
         self.target_vy_end = 0.0
-        self.use_smooth_transition = True       # toggle for testing
+        self.use_smooth_transition = True
+        self.smooth_transition_prob = 0.5
 
         # ---- State limits ----
         self.max_v = 10.0
         self.max_theta = np.pi
         self.max_vtheta = 3.0
 
-        # ---- Target update ----
+        # ---- Misc ----
         self.step_counter = 0
-
-        # ---- Episode length ----
         self.max_episode_steps = 600
-
-        # ---- World (for rendering only) ----
         self.world_size = 40.0
         self.x = 0.0
         self.y = 0.0
@@ -123,28 +127,55 @@ class VelocityTrackingEnv(gym.Env):
         self._episode_length = 0
 
     # ------------------------------------------------------------------
-    # NEW: Wind methods
+    # Wind: natural distribution
     # ------------------------------------------------------------------
-    def _set_new_wind(self):
-        """Abrupt wind: sample a new 2D force vector (step change, no smoothing)."""
+    def _start_wind_period(self, active=None):
+        """
+        Enter a new wind regime.
+        If `active` is None → decide via Markov chain (regime transition).
+        If `active` is True/False → force that regime.
+        """
         if not self.use_wind:
+            self.wind_active = False
             self.wind_x = 0.0
             self.wind_y = 0.0
+            self.wind_change_counter = 0
+            self.wind_change_interval = 100
             return
-        self.wind_x = np.random.uniform(-self.wind_max_force, self.wind_max_force)
-        self.wind_y = np.random.uniform(-self.wind_max_force, self.wind_max_force)
+
+        if active is None:
+            if self.wind_active:
+                # Currently ON → stay ON w.p. stay_on_prob, else turn OFF
+                active = np.random.random() < self.wind_stay_on_prob
+            else:
+                # Currently OFF → turn ON w.p. turn_on_prob, else stay OFF
+                active = np.random.random() < self.wind_turn_on_prob
+
+        self.wind_active = active
+        self.wind_change_counter = 0
+
+        if active:
+            # Sample a fresh gust magnitude
+            self.wind_x = np.random.uniform(-self.wind_max_force, self.wind_max_force)
+            self.wind_y = np.random.uniform(-self.wind_max_force, self.wind_max_force)
+            # Exponential duration: mostly short, occasionally long
+            self.wind_change_interval = max(
+                30, int(np.random.exponential(self.wind_on_duration_mean))
+            )
+        else:
+            self.wind_x = 0.0
+            self.wind_y = 0.0
+            self.wind_change_interval = max(
+                50, int(np.random.exponential(self.wind_off_duration_mean))
+            )
 
     def _update_wind(self):
-        """Count steps; when interval elapses, abruptly switch to new wind."""
+        """Count steps; when period ends, transition via Markov chain."""
         if not self.use_wind:
             return
         self.wind_change_counter += 1
         if self.wind_change_counter >= self.wind_change_interval:
-            self._set_new_wind()
-            self.wind_change_counter = 0
-            self.wind_change_interval = np.random.randint(
-                self.wind_change_interval_min, self.wind_change_interval_max
-            )
+            self._start_wind_period(active=None)
 
     # ------------------------------------------------------------------
     def reset(self, seed=None, options=None):
@@ -173,12 +204,16 @@ class VelocityTrackingEnv(gym.Env):
             self.target_change_interval_min, self.target_change_interval_max
         )
 
-        # NEW: reset wind
-        self._set_new_wind()
-        self.wind_change_counter = 0
-        self.wind_change_interval = np.random.randint(
-            self.wind_change_interval_min, self.wind_change_interval_max
-        )
+        # ---- Per-episode wind personality ----
+        # Each episode gets its own statistics → calm days vs stormy days
+        self.wind_turn_on_prob      = np.random.uniform(0.15, 0.60)
+        self.wind_stay_on_prob      = np.random.uniform(0.05, 0.50)
+        self.wind_on_duration_mean  = np.random.uniform(50, 150)
+        self.wind_off_duration_mean = np.random.uniform(100, 400)
+
+        # ---- Initial regime: Markov from OFF state ----
+        self.wind_active = False
+        self._start_wind_period(active=None)
 
         return self._get_obs(), {}
 
@@ -187,12 +222,11 @@ class VelocityTrackingEnv(gym.Env):
         new_vx = np.random.uniform(-7.0, 7.0)
         new_vy = np.random.uniform(-7.0, 7.0)
 
-        # 10% chance to keep the same target (drone can rest)
+        # 10% chance to keep the same target
         if np.random.random() < 0.1:
             new_vx = self.target_vx
             new_vy = self.target_vy
 
-        # Randomize the smooth-vs-step probability per change
         self.smooth_transition_prob = np.random.uniform(0.2, 0.8)
         self.use_smooth_transition = np.random.random() < self.smooth_transition_prob
 
@@ -239,8 +273,7 @@ class VelocityTrackingEnv(gym.Env):
         norm_vtheta = np.clip(self.vtheta / self.max_vtheta, -1.0, 1.0)
         norm_tvx = np.clip(self.target_vx / self.max_v, -1.0, 1.0)
         norm_tvy = np.clip(self.target_vy / self.max_v, -1.0, 1.0)
-        # NOTE: wind is NOT included — expert must infer disturbance from
-        # the gap between current velocity and target velocity.
+        # NOTE: wind is NOT included — expert must infer via velocity error.
         return np.array([norm_vx, norm_vy, norm_theta, norm_vtheta,
                          norm_tvx, norm_tvy], dtype=np.float32)
 
@@ -250,7 +283,8 @@ class VelocityTrackingEnv(gym.Env):
             print(f"pos: ({self.x:.1f}, {self.y:.1f}), "
                   f"v: ({self.vx:.2f}, {self.vy:.2f}), "
                   f"target: ({self.target_vx:.2f}, {self.target_vy:.2f}), "
-                  f"wind: ({self.wind_x:.2f}, {self.wind_y:.2f})")
+                  f"wind: ({self.wind_x:.2f}, {self.wind_y:.2f}), "
+                  f"active: {self.wind_active}")
             return
 
         width, height = 800, 800
@@ -335,12 +369,22 @@ class VelocityTrackingEnv(gym.Env):
                     (10, 110), font, 0.5, (200, 200, 200), 1)
         cv2.putText(canvas, f"Steps: {timesteps}", (10, 140), font, 0.5, (200, 200, 200), 1)
 
-        # NEW: wind indicator
-        wind_mag = abs(self.wind_x) + abs(self.wind_y)
-        wind_color = (255, 0, 0) if wind_mag > 5.0 else (150, 150, 150)
+        # ---- Wind indicator: CALM vs GUSTY ----
+        if not self.wind_active:
+            cv2.putText(canvas, "Wind: CALM",
+                        (10, 170), font, 0.5, (150, 150, 150), 1)
+        else:
+            wind_mag = abs(self.wind_x) + abs(self.wind_y)
+            wind_color = (255, 0, 0) if wind_mag > 5.0 else (200, 100, 100)
+            cv2.putText(canvas,
+                        f"Wind: ({self.wind_x:+.1f}, {self.wind_y:+.1f}) N",
+                        (10, 170), font, 0.5, wind_color, 1)
+
+        # ---- Episode personality (small grey hint) ----
         cv2.putText(canvas,
-                    f"Wind: ({self.wind_x:+.1f}, {self.wind_y:+.1f}) N",
-                    (10, 170), font, 0.5, wind_color, 1)
+                    f"regime: p_on={self.wind_turn_on_prob:.2f} "
+                    f"p_stay={self.wind_stay_on_prob:.2f}",
+                    (10, 195), font, 0.4, (120, 120, 120), 1)
 
         cv2.putText(canvas, "Green Arrow = Target Velocity", (10, height - 30),
                     font, 0.4, (0, 255, 0), 1)
@@ -360,7 +404,7 @@ class VelocityTrackingEnv(gym.Env):
         f_right = action[1] * self.max_thrust_each
         total_thrust = f_left + f_right
 
-        # NEW: wind enters as an external force, divided by mass for acceleration
+        # Wind enters as external force; zero when calm, nonzero when gusty
         ax = (total_thrust / self.mass) * np.sin(self.theta) + self.wind_x / self.mass
         ay = (total_thrust / self.mass) * np.cos(self.theta) - self.g + self.wind_y / self.mass
         alpha = ((f_right - f_left) * self.d) / self.I
@@ -387,10 +431,10 @@ class VelocityTrackingEnv(gym.Env):
 
         # Reward
         vel_error_penalty = -0.04 * (vx_err**2 + vy_err**2)
-        tilt_penalty = -0.0005 * self.theta**2
-        vtheta_penalty = -0.0005 * self.vtheta**2
-        ax_penalty = -0.0005 * ax**2
-        ay_penalty = -0.0005 * ay**2
+        tilt_penalty      = -0.0005 * self.theta**2
+        vtheta_penalty    = -0.0005 * self.vtheta**2
+        ax_penalty        = -0.0005 * ax**2
+        ay_penalty        = -0.0005 * ay**2
         action_diff = action - self.prev_action
         action_penalty = -0.001 * (action_diff[0]**2 + action_diff[1]**2)
 
@@ -401,8 +445,6 @@ class VelocityTrackingEnv(gym.Env):
         self._episode_reward += reward
 
         self._update_target()
-
-        # NEW: update wind (abrupt step change when interval elapses)
         self._update_wind()
 
         truncated = False
@@ -535,14 +577,11 @@ def train():
         existing_models = [f for f in os.listdir(SAVE_DIR)
                           if f.startswith(MODEL_NAME) and f.endswith('.zip')]
         if existing_models:
-            def get_ep_num(fname):
-                try:
-                    return int(fname.split('_ep')[-1].split('.')[0])
-                except:
-                    return 0
-            latest = max(existing_models, key=get_ep_num)
+            # Pick the most recently modified file
+            latest = max(existing_models,
+                        key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)))
             model_path = os.path.join(SAVE_DIR, latest)
-            print(f"\n[LOAD] Found existing model: {model_path}. Loading...")
+            print(f"\n[LOAD] Resuming from latest checkpoint: {model_path}")
         else:
             print("\n[INFO] No existing model found. Starting fresh training.")
 
@@ -581,28 +620,22 @@ def train():
         save_interval=SAVE_EPISODE_INTERVAL
     )
 
-    print("\n[INFO] Starting training for Velocity Expert (WITH abrupt wind)...")
+    print("\n[INFO] Starting training for Velocity Expert (natural wind)...")
     print(f"   - Save directory: {os.path.abspath(SAVE_DIR)}")
     print(f"   - Model checkpoint every {SAVE_EPISODE_INTERVAL} episode(s)")
     print(f"   - Reward plot updated every {PLOT_INTERVAL} episode(s)")
     print(f"   - OpenCV render every {RENDER_EPISODE_FREQ} episodes")
-    print(f"   - Wind: ±{train_env.wind_max_force:.0f} N, changes every "
-          f"{train_env.wind_change_interval_min}–{train_env.wind_change_interval_max} steps")
+    print(f"   - Wind: max ±{train_env.wind_max_force:.0f} N per axis")
+    print("   - Per-episode personality + Markov transitions + exp. durations")
     print("   - Press Ctrl+C to interrupt and save the current model & plot.\n")
 
     try:
         model.learn(total_timesteps=2_000_000, callback=callback)
     except KeyboardInterrupt:
-        print("\n[INTERRUPT] Training interrupted by user. Saving current model and plot...")
-        interrupt_path = os.path.join(SAVE_DIR, f"{MODEL_NAME}_interrupt")
-        model.save(interrupt_path)
-        print(f"  [SAVE] Model saved to {interrupt_path}.zip")
+        print("\n[INTERRUPT] Training interrupted. Overwriting base checkpoint...")
+        model.save(os.path.join(SAVE_DIR, MODEL_NAME))
+        print(f"  [SAVE] {MODEL_NAME}.zip updated with current weights.")
         callback._update_plot()
-        print("  [SAVE] Plot updated.")
-        if callback.ep_counter > 0:
-            ep_path = os.path.join(SAVE_DIR, f"{MODEL_NAME}_ep{callback.ep_counter}")
-            model.save(ep_path)
-            print(f"  [SAVE] Model also saved as {ep_path}.zip")
         sys.exit(0)
     finally:
         final_path = os.path.join(SAVE_DIR, f"{MODEL_NAME}_final")
@@ -616,39 +649,37 @@ def test(model_path=None, episodes=5):
     env = VelocityTrackingEnv()
 
     if model_path is None:
-        existing_models = [f for f in os.listdir(SAVE_DIR)
-                          if f.startswith(MODEL_NAME) and f.endswith('.zip')]
-        if not existing_models:
-            print(f"[ERROR] No model found in {SAVE_DIR} starting with '{MODEL_NAME}'")
-            return
-        final_models = [f for f in existing_models if 'final' in f]
-        if final_models:
-            model_path = os.path.join(SAVE_DIR, final_models[0])
+        final_path = os.path.join(SAVE_DIR, f"{MODEL_NAME}_final.zip")
+        base_path  = os.path.join(SAVE_DIR, f"{MODEL_NAME}.zip")
+
+        if os.path.exists(final_path):
+            model_path = final_path
+            print(f"[INFO] Using final checkpoint: {final_path}")
+        elif os.path.exists(base_path):
+            model_path = base_path
+            print(f"[INFO] Using live checkpoint: {base_path}")
         else:
-            def get_ep_num(fname):
-                try:
-                    return int(fname.split('_ep')[-1].split('.')[0])
-                except:
-                    return 0
-            latest = max(existing_models, key=get_ep_num)
-            model_path = os.path.join(SAVE_DIR, latest)
+            print(f"[ERROR] No model found at {base_path} or {final_path}")
+            return
 
     print(f"\n[INFO] Testing model: {model_path}")
     model = PPO.load(model_path, env=env,
                      device="cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"\n[INFO] Testing for {episodes} episodes (WITH abrupt wind)...\n")
+    print(f"\n[INFO] Testing for {episodes} episodes (natural wind)...\n")
 
     for ep in range(episodes):
         obs, _ = env.reset()
         terminated, truncated = False, False
         steps = 0
         total_reward = 0.0
+        windy_steps = 0
 
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, _ = env.step(action)
             total_reward += reward
+            windy_steps += int(env.wind_active)
             env.render(mode="cv2", timesteps=steps, total_reward=total_reward)
             steps += 1
 
@@ -658,7 +689,9 @@ def test(model_path=None, episodes=5):
                 return
 
         cv2.waitKey(500)
-        print(f"Episode {ep+1}: Reward = {total_reward:.2f}, Steps = {steps}")
+        print(f"Episode {ep+1}: Reward = {total_reward:.2f}, Steps = {steps}, "
+              f"Windy = {windy_steps/steps:.0%} "
+              f"(p_on={env.wind_turn_on_prob:.2f}, p_stay={env.wind_stay_on_prob:.2f})")
         cv2.destroyAllWindows()
 
     print("\n[SUCCESS] Testing complete.")
